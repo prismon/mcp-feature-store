@@ -36,7 +36,7 @@ synthesis/
 
 ## Technology Stack
 
-- **Language**: Go 1.22
+- **Language**: Go 1.23
 - **MCP Library**: github.com/mark3labs/mcp-go
 - **Database**: PostgreSQL 16
   - pgvector: Vector embeddings and similarity search
@@ -49,7 +49,7 @@ synthesis/
 ### Prerequisites
 
 - Docker and Docker Compose
-- Go 1.22+ (for local development)
+- Go 1.23+ (for local development)
 
 ### Using Docker Compose (Recommended)
 
