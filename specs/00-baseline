@@ -1,0 +1,534 @@
+s a single document. You can save it locally as something like:
+
+./synthesis-system-design-mcp-go-postgres.md
+
+# Synthesis System Design (Go + MCP + Postgres)
+
+## 1. Overview
+
+Synthesis is a tool for AI systems that acts as a **central nervous system** for individual users and small to mid-sized companies.
+
+This version of Synthesis is implemented as an **MCP server in Go** (using [`github.com/mark3labs/mcp-go`]) and backed by **PostgreSQL** with:
+
+- **pgvector** for vector embeddings and similarity search.
+- A **graph extension** (e.g. Apache AGE or SQL/PGQ) for relationship-heavy queries.
+- **MCP streamable HTTP transport** and **stdio transport** for integration with AI agents.
+
+The legacy REST + WebSocket interface remains for non-MCP clients, but MCP is the **primary interface for AI systems**.
+
+---
+
+## 2. Goals
+
+1. Provide a robust **MCP-based integration surface** for AI agents.
+2. Model the domain using **MCP resources and tools** instead of Kubernetes resources.
+3. Use **Go** as the primary implementation language.
+4. Use **PostgreSQL** (not SQLite) with pgvector and a graph extension.
+5. Support **streaming responses** via MCP Streamable HTTP.
+6. Maintain or improve existing functionality (tenants, libraries, notebooks, features, types, products, tools).
+
+---
+
+## 3. High-Level Architecture
+
+### 3.1 Components
+
+- **MCP Server Layer (Go + mcp-go)**
+  - Implements MCP **resources**, **resource templates**, and **tools**.
+  - Supports **stdio** and **streamable HTTP** transports.
+  - Maps MCP URIs (`synthesis://…`) to Postgres-backed domain entities.
+
+- **REST / WebSocket Layer**
+  - Traditional HTTP API for browsers and other services.
+  - WebSockets for real-time updates (e.g. notebook edits).
+
+- **Domain Layer**
+  - Go structs for Tenant, Library, Notebook, Feature, Type, Product, Tool.
+  - Domain services implement business rules and workflows.
+
+- **Persistence Layer (Postgres)**
+  - Repositories encapsulate SQL queries and transactions.
+  - Includes support for pgvector and graph queries.
+
+- **Security Layer**
+  - OIDC for authentication.
+  - OPA (Rego) for authorization of REST + MCP operations.
+
+### 3.2 Tech Stack
+
+- **Language:** Go  
+- **MCP Server Library:** `github.com/mark3labs/mcp-go`  
+- **Database:** PostgreSQL  
+  - Extension: `vector` (pgvector) for embeddings.  
+  - Graph extension: e.g. Apache AGE or native SQL/PGQ where available.  
+- **HTTP / Web:** `net/http` plus router (chi/gin/echo – TBD).  
+- **Authn:** OIDC (e.g. `go-oidc`).  
+- **Authz:** Open Policy Agent (OPA) via Go OPA/Rego integration.
+
+---
+
+## 4. Domain Model
+
+We retain the Domain-Driven Design core domain:
+
+- **Tenant** – Top-level organization unit.
+- **Library** – Collection of notebooks within a tenant.
+- **Notebook** – Primary editable element with hierarchical content blocks.
+- **Feature** – Derived data (text, JSON, images, structured values) associated with resources.
+- **Type** – Content type definitions, renderers, editors, and constraints.
+- **Product** – Business product associated with a tenant.
+- **Tool** – Configuration for external tools/integrations associated with a tenant.
+
+### 4.1 Go Struct Sketches (Domain)
+
+_These are conceptual and can be refined later._
+
+```go
+type Tenant struct {
+    ID           string
+    Owner        string
+    DisplayName  string
+    Description  string
+    Labels       map[string]string
+    Version      string
+    LastModified time.Time
+}
+
+type Library struct {
+    TenantID    string
+    ID          string
+    Owner       string
+    DisplayName string
+    Description string
+    Labels      map[string]string
+}
+
+type Notebook struct {
+    TenantID      string
+    ID            string
+    LibraryID     string
+    Status        string
+    Owner         string
+    DisplayName   string
+    Description   string
+    Contents      NotebookContents
+    Notifications []Notification
+}
+
+type NotebookContents struct {
+    Markdown      string
+    ContentBlocks []ContentBlock
+}
+
+type ContentBlock struct {
+    UID         string
+    ParentUID   *string
+    ContentType string
+    Data        string
+    Order       int
+    Types       []string
+}
+
+type Feature struct {
+    TenantID      string
+    ID            string
+    DisplayName   string
+    Description   string
+    Resources     []ExternalResource
+    Notifications []Notification
+    TTL           time.Duration
+    Values        map[string]string // text, base64, etc.
+}
+
+type TypeDef struct {
+    Name        string
+    Description string
+    Renderers   []Renderer
+    Editors     []Editor
+    Constraints []Constraint
+    Labels      map[string]string
+}
+
+type Product struct {
+    TenantID    string
+    ID          string
+    DisplayName string
+    Description string
+    // Associations to notebooks/features via graph or join tables
+}
+
+type ToolConfig struct {
+    TenantID    string
+    ID          string
+    DisplayName string
+    Description string
+    Config      map[string]any
+}
+
+
+⸻
+
+5. MCP Model
+
+5.1 Resources & URIs
+
+Each domain entity is exposed as MCP Resources via URI templates. Examples:
+
+Entity	URI Template	mimeType
+Tenant	synthesis://tenant/{tenantId}	application/json
+Library	synthesis://tenant/{tenantId}/library/{libraryId}	application/json
+Notebook	synthesis://tenant/{tenantId}/notebook/{notebookId}	application/json
+Feature	synthesis://tenant/{tenantId}/feature/{featureId}	application/json
+Type	synthesis://type/{typeName}	application/json
+Product	synthesis://tenant/{tenantId}/product/{productId}	application/json
+Tool	synthesis://tenant/{tenantId}/tool/{toolId}	application/json
+
+Resource metadata returned by resources/list includes:
+	•	uri
+	•	name
+	•	title
+	•	description
+	•	mimeType
+	•	optional _meta (version, labels, last_modified, etc.)
+
+Resource content returned by resources/read is the JSON-serialized domain object.
+
+Example: Tenant Resource Content
+
+{
+  "tenantId": "technicaldetails",
+  "owner": "josh@prismon.com",
+  "display_name": "Joshua's Personal Tenant",
+  "description": "This is a simple tenant",
+  "labels": {
+    "environment": "production",
+    "app": "nginx"
+  },
+  "version": "1234567",
+  "last_modified": "2025-03-29T22:04:51Z"
+}
+
+Example: Notebook Resource Content
+
+{
+  "tenantId": "technicaldetails",
+  "notebookId": "josh_notes_2025",
+  "libraryId": "technicaldetails-default-library",
+  "status": "approved",
+  "owner": "josh@prismon.com",
+  "display_name": "Notes from 3/27/2025",
+  "description": "Here are knowledge elements from my obsidian notebook",
+  "contents": {
+    "data": {
+      "Markdown": "## Typographic replacements\nEnable typographer option to see result.\n"
+    },
+    "content_blocks": [
+      {
+        "uid": "550e8400-e29b-41d4-a716-446655440000",
+        "content_type": "text/markdown",
+        "data": "# Header\nThis is the first paragraph",
+        "order": 1,
+        "types": ["heading", "text"]
+      },
+      {
+        "uid": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+        "parent_uid": "550e8400-e29b-41d4-a716-446655440000",
+        "content_type": "binary/image",
+        "data": "base64encodedimagedata",
+        "order": 1,
+        "types": ["image"]
+      }
+    ]
+  },
+  "notification": [
+    { "nurl": "https://www.technicaldetails.org/modify_alert" }
+  ]
+}
+
+5.2 Tools
+
+MCP tools expose actions over those resources. Examples:
+	•	create_tenant
+	•	create_library
+	•	create_notebook
+	•	append_content_block
+	•	generate_features_for_notebook
+	•	semantic_search_notebooks
+	•	graph_query_resources
+	•	validate_resource
+	•	check_policy
+
+Example: create_notebook Tool (JSON Schema)
+
+{
+  "name": "create_notebook",
+  "description": "Create a new notebook in a library for a tenant.",
+  "inputSchema": {
+    "type": "object",
+    "required": ["tenantId", "libraryId", "notebookId", "display_name"],
+    "properties": {
+      "tenantId": { "type": "string" },
+      "libraryId": { "type": "string" },
+      "notebookId": { "type": "string" },
+      "display_name": { "type": "string" },
+      "description": { "type": "string" },
+      "initial_markdown": { "type": "string" }
+    }
+  },
+  "outputSchema": {
+    "type": "object",
+    "properties": {
+      "notebookUri": {
+        "type": "string",
+        "description": "URI of the created notebook"
+      }
+    }
+  }
+}
+
+Implementation notes:
+	•	Tool handler validates input.
+	•	Loads tenant & library from Postgres.
+	•	Performs validation + OPA policy check.
+	•	Inserts notebook, content rows, optional embeddings/graph nodes.
+	•	Returns the notebookUri.
+
+⸻
+
+6. MCP Transports & Streamable Support
+
+6.1 stdio Transport
+	•	Designed for local integration (e.g., IDE plugin, desktop agents).
+	•	Go MCP server reads/writes JSON-RPC messages over stdin/stdout.
+	•	Implemented using mcp-go’s stdio helpers.
+
+6.2 Streamable HTTP
+	•	Single endpoint (example): POST /mcp for JSON-RPC requests.
+	•	Streaming responses use Server-Sent Events (SSE) or a compatible mechanism as per the MCP streamable spec.
+	•	Use cases:
+	•	Long-running tools (e.g., large semantic searches).
+	•	Incremental notebook content generation.
+	•	Progress reporting for feature/embedding generation.
+
+Capabilities:
+	•	Tools can opt into streaming mode.
+	•	Host chooses streaming vs non-streaming per call.
+
+⸻
+
+7. Postgres Schema & Extensions
+
+7.1 Baseline Tables
+
+Core relational tables (high-level, not full DDL):
+	•	tenant(id, owner, display_name, description, labels_json, version, last_modified)
+	•	library(id, tenant_id, owner, display_name, description, labels_json)
+	•	notebook(id, tenant_id, library_id, status, owner, display_name, description)
+	•	notebook_notification(id, notebook_id, nurl)
+	•	notebook_content(id, notebook_id, markdown)
+	•	content_block(id, notebook_id, uid, parent_uid, content_type, data, "order")
+	•	content_block_type(id, content_block_id, type_name)
+	•	feature(id, tenant_id, display_name, description, ttl, values_json)
+	•	feature_resource(id, feature_id, url)
+	•	feature_notification(id, feature_id, nurl)
+	•	type_def(id, name, description, renderers_json, editors_json, constraints_json, labels_json)
+	•	product(id, tenant_id, display_name, description)
+	•	product_user(product_id, user_id, role)
+	•	tool(id, tenant_id, display_name, description, config_json)
+	•	Optional: resource_index(uri, entity_type, entity_id) for fast URI resolution.
+
+7.2 pgvector
+
+Enable pgvector:
+
+CREATE EXTENSION IF NOT EXISTS vector;
+
+Example embedding table for notebook content:
+
+CREATE TABLE notebook_embedding (
+  notebook_id UUID PRIMARY KEY REFERENCES notebook(id),
+  embedding   vector(1536) -- match chosen model dimension
+);
+
+CREATE INDEX idx_notebook_embedding_vector
+ON notebook_embedding
+USING ivfflat (embedding vector_ops);
+
+Used for:
+	•	semantic_search_notebooks MCP tool.
+	•	Related operations like “find similar notebooks/features”.
+
+7.3 Graph Extension
+
+Enable a graph extension (e.g., Apache AGE or native SQL/PGQ). Conceptually:
+	•	Graph: synthesis_graph with:
+	•	Nodes: tenants, libraries, notebooks, features, products, tools.
+	•	Edges (examples):
+	•	(:Notebook)-[:BELONGS_TO]->(:Library)
+	•	(:Library)-[:BELONGS_TO]->(:Tenant)
+	•	(:Feature)-[:DERIVES_FROM]->(:Notebook)
+	•	(:Notebook)-[:PART_OF_PRODUCT]->(:Product)
+	•	(:Notebook)-[:USES_TOOL]->(:Tool)
+
+Used for tools like:
+	•	graph_query_resources
+	•	“Find all notebooks for product X within 2 hops”.
+	•	“Show feature lineage back to original notebooks/tenants”.
+
+⸻
+
+8. REST & WebSocket API (Non-MCP Clients)
+
+REST endpoints are similar to the original design (now backed by Postgres):
+	•	Tenant
+	•	GET /api/v1/tenants
+	•	POST /api/v1/tenants
+	•	GET /api/v1/tenants/:id
+	•	PUT /api/v1/tenants/:id
+	•	DELETE /api/v1/tenants/:id
+	•	Library
+	•	GET /api/v1/libraries/by-tenant/:tenantId
+	•	POST /api/v1/libraries/by-tenant/:tenantId
+	•	GET /api/v1/libraries/:id
+	•	PUT /api/v1/libraries/:id
+	•	DELETE /api/v1/libraries/:id
+	•	Notebook
+	•	GET /api/v1/notebooks/by-library/:libraryId
+	•	POST /api/v1/notebooks/by-library/:libraryId
+	•	GET /api/v1/notebooks/:id
+	•	PUT /api/v1/notebooks/:id
+	•	DELETE /api/v1/notebooks/:id
+	•	Feature, Type, Product, Tool
+	•	Similar CRUD patterns.
+
+WebSockets:
+	•	Notify connected clients about changes:
+	•	Notebook edits and approvals.
+	•	New features generated.
+	•	Product or type definition changes.
+
+⸻
+
+9. Authentication & Authorization
+
+9.1 Authentication (OIDC)
+	•	Use an OIDC provider (e.g., Auth0, Okta, custom) with JWT access tokens.
+	•	Go server validates tokens using a library such as go-oidc.
+	•	Claims (subject, tenant, roles) are attached to the request context.
+
+9.2 Authorization (OPA)
+	•	Policies written in Rego define which operations and resources are allowed.
+	•	For each MCP tool call or REST request:
+	•	Build an input object containing:
+	•	subject (user id, roles)
+	•	action (tool name or HTTP method+path)
+	•	resource (target URI or entity id/tenant)
+	•	Evaluate OPA policy; deny or allow accordingly.
+
+Example policy scenarios:
+	•	Only tenant owners can delete tenants.
+	•	Users can only access notebooks in tenants they belong to.
+	•	Some tools (e.g., graph_query_resources) may only be available to admins.
+
+⸻
+
+10. UI Architecture
+
+10.1 Web UI
+
+Existing stack:
+	•	React for the SPA.
+	•	Editor.js for rich text editing.
+	•	Tailwind CSS for styling.
+
+Integration:
+	•	Use REST + WebSockets as primary channels.
+	•	For AI-enhanced flows, the Web UI can call an intermediate backend that acts as an MCP host, which in turn talks to the Synthesis MCP server.
+
+10.2 Desktop and Other Clients
+	•	Future native desktop apps (Windows, macOS, Linux):
+	•	Use REST + WebSockets, and/or
+	•	Act as MCP hosts and communicate via stdio or Streamable HTTP.
+	•	IDE plugins or CLI tools can talk directly to MCP via stdio or HTTP.
+
+⸻
+
+11. Implementation Plan
+
+11.1 Repository Layout (Proposed)
+
+synthesis/
+  cmd/
+    synthesis-mcp/        # MCP server main
+    synthesis-api/        # REST + WebSocket server main (or combined)
+  internal/
+    config/               # Configuration loading
+    domain/
+      tenant.go
+      library.go
+      notebook.go
+      feature.go
+      type.go
+      product.go
+      tool.go
+    postgres/
+      db.go               # connection, migrations
+      tenant_repo.go
+      library_repo.go
+      notebook_repo.go
+      feature_repo.go
+      type_repo.go
+      product_repo.go
+      tool_repo.go
+      vector_repo.go      # pgvector-related queries
+      graph_repo.go       # graph-related queries
+    mcp/
+      server.go           # mcp-go server setup
+      resources.go        # resource templates and read/list handlers
+      tools_notebook.go   # create_notebook, append_block, etc.
+      tools_feature.go    # generate_features, etc.
+      tools_search.go     # semantic_search_notebooks, graph_query_resources
+      tools_admin.go      # create_tenant, etc.
+    rest/
+      handlers.go         # HTTP handlers
+      middleware.go       # auth, logging
+      websocket.go        # WS hub and events
+    security/
+      oidc.go             # token validation
+      opa.go              # policy evaluation
+
+11.2 Migration Steps
+	1.	Set up Postgres
+	•	Create base schema and enable vector + graph extension.
+	2.	Port Domain & Persistence
+	•	Implement Go domain structs and repository methods.
+	3.	Implement MCP Server
+	•	Initialize mcp-go server.
+	•	Implement resources/list, resources/read mapping to Postgres.
+	•	Implement core tools (create_notebook, etc.).
+	4.	Add Streamable HTTP Transport
+	•	Implement HTTP entrypoint compatible with MCP Streamable spec.
+	•	Add streaming support to long-running tools.
+	5.	Hook Up Authn/Authz
+	•	Integrate OIDC and OPA into both MCP and REST layers.
+	6.	Port/Integrate REST + WebSockets
+	•	Adapt existing REST contract as needed to work with new domain + repos.
+	7.	Add Vector + Graph Features
+	•	Implement semantic_search_notebooks and graph_query_resources tools.
+	•	Back them with pgvector and graph queries.
+	8.	Testing & Validation
+	•	Unit, integration, and end-to-end tests for MCP + REST.
+	•	Performance tests for large notebooks and vector/graph operations.
+
+⸻
+
+12. Future Enhancements
+	•	MCP Roots & Tenant Scoping
+	•	Use MCP roots to expose only a subset of URIs per client/session (e.g. per-tenant).
+	•	Advanced Query Tools
+	•	Rich query languages (filters, full-text + vector hybrid search).
+	•	Plugin Architecture
+	•	Allow registering other MCP servers as “external tools” in Synthesis.
+	•	Offline & Sync
+	•	Desktop/mobile clients with offline operation, syncing to the central Postgres backend.
+
